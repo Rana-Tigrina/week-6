@@ -5,6 +5,7 @@ from pydantic import BaseModel
 import numpy as np # Import numpy for safety, though a list works too
 
 # Create FastAPI app
+#chnages for commit
 app = FastAPI(title="Iris Classifier API 🌸")
 
 # Load model
