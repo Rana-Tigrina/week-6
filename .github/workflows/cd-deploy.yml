@@ -30,9 +30,25 @@ jobs:
     - name: Set up Cloud SDK
       uses: google-github-actions/setup-gcloud@v1
 
-    - name: Configure Docker for Artifact Registry
+
+    - name: Configure Docker Authentication
       run: |
-        gcloud auth configure-docker ${{ env.GKE_REGION }}-docker.pkg.dev
+        gcloud auth configure-docker ${{ env.GKE_REGION }}-docker.pkg.dev --quiet
+
+
+    - name: Docker Login to Artifact Registry
+      run: |
+        gcloud auth print-access-token | docker login -u oauth2accesstoken --password-stdin https://${{ env.GKE_REGION }}-docker.pkg.dev
+
+    - name: Verify required files
+      run: |
+        echo "Checking required files..."
+        ls -la
+        if [ ! -f "model.joblib" ]; then
+          echo "❌ model.joblib not found!"
+          exit 1
+        fi
+        echo "✅ All files present"
 
     - name: Build Docker image
       run: |
@@ -40,54 +56,111 @@ jobs:
         docker tag ${{ env.GKE_REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.ARTIFACT_REPO }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
                    ${{ env.GKE_REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.ARTIFACT_REPO }}/${{ env.IMAGE_NAME }}:latest
 
+    # UPDATED - Push with retry logic
     - name: Push to Artifact Registry
       run: |
-        docker push ${{ env.GKE_REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.ARTIFACT_REPO }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
-        docker push ${{ env.GKE_REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.ARTIFACT_REPO }}/${{ env.IMAGE_NAME }}:latest
+        echo "Pushing image with SHA tag..."
+        docker push ${{ env.GKE_REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.ARTIFACT_REPO }}/${{ env.IMAGE_NAME }}:${{ github.sha }} || {
+          echo "First push attempt failed, retrying..."
+          sleep 10
+          docker push ${{ env.GKE_REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.ARTIFACT_REPO }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+        }
+        
+        echo "Pushing image with latest tag..."
+        docker push ${{ env.GKE_REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.ARTIFACT_REPO }}/${{ env.IMAGE_NAME }}:latest || {
+          echo "First push attempt failed, retrying..."
+          sleep 10
+          docker push ${{ env.GKE_REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.ARTIFACT_REPO }}/${{ env.IMAGE_NAME }}:latest
+        }
 
     - name: Get GKE credentials
       run: |
         gcloud container clusters get-credentials ${{ env.GKE_CLUSTER }} --region ${{ env.GKE_REGION }}
 
-    - name: Update Kubernetes manifests
-      run: |
-        # Replace image placeholder in deployment.yaml
-        sed -i "s|IMAGE_PLACEHOLDER|${{ env.GKE_REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.ARTIFACT_REPO }}/${{ env.IMAGE_NAME }}:${{ github.sha }}|g" k8s/deployment.yaml
-        
-        # Show what will be deployed
-        echo "=== Deployment YAML ==="
-        cat k8s/deployment.yaml
-        echo "=== Service YAML ==="
-        cat k8s/service.yaml
-
     - name: Deploy to GKE
       run: |
-        kubectl apply -f k8s/deployment.yaml
-        kubectl apply -f k8s/service.yaml
-        kubectl rollout status deployment/iris-api-deployment
+        cat <<EOF | kubectl apply -f -
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: iris-api-deployment
+          labels:
+            app: iris-api
+        spec:
+          replicas: 2
+          selector:
+            matchLabels:
+              app: iris-api
+          template:
+            metadata:
+              labels:
+                app: iris-api
+            spec:
+              containers:
+              - name: iris-api
+                image: ${{ env.GKE_REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.ARTIFACT_REPO }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+                ports:
+                - containerPort: 8200
+                resources:
+                  requests:
+                    memory: "128Mi"
+                    cpu: "100m"
+                  limits:
+                    memory: "256Mi"
+                    cpu: "200m"
+                livenessProbe:
+                  httpGet:
+                    path: /health
+                    port: 8200
+                  initialDelaySeconds: 30
+                  periodSeconds: 10
+                readinessProbe:
+                  httpGet:
+                    path: /health
+                    port: 8200
+                  initialDelaySeconds: 10
+                  periodSeconds: 5
+        EOF
 
-    - name: Get deployment info
+    - name: Expose service
       run: |
-        echo "=== Deployments ==="
-        kubectl get deployments
-        
+        cat <<EOF | kubectl apply -f -
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: iris-api-service
+        spec:
+          type: LoadBalancer
+          selector:
+            app: iris-api
+          ports:
+            - protocol: TCP
+              port: 80
+              targetPort: 8200
+        EOF
+
+    - name: Wait for deployment
+      run: |
+        kubectl rollout status deployment/iris-api-deployment --timeout=5m
+        echo "✅ Deployment complete"
+
+    - name: Get service info
+      run: |
         echo "=== Pods ==="
         kubectl get pods -l app=iris-api
         
-        echo "=== Services ==="
-        kubectl get services
+        echo "=== Service ==="
+        kubectl get service iris-api-service
         
-        echo "=== Waiting for LoadBalancer IP ==="
+        echo "Waiting for LoadBalancer IP..."
         sleep 60
         
         EXTERNAL_IP=$(kubectl get service iris-api-service -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
         
         if [ -z "$EXTERNAL_IP" ]; then
           echo "⏳ LoadBalancer IP not ready yet"
-          echo "Check later with: kubectl get service iris-api-service"
         else
-          echo "✅ API deployed successfully!"
           echo "✅ API URL: http://$EXTERNAL_IP"
           echo "✅ API Docs: http://$EXTERNAL_IP/docs"
-          echo "✅ Health: http://$EXTERNAL_IP/health"
+          echo "✅ Health Check: http://$EXTERNAL_IP/health"
         fi
