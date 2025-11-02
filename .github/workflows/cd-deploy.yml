@@ -1,0 +1,93 @@
+name: CD - Deploy to GKE
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  GKE_CLUSTER: ${{ secrets.GKE_CLUSTER_NAME }}
+  GKE_REGION: ${{ secrets.GCP_REGION }}
+  ARTIFACT_REPO: ${{ secrets.ARTIFACT_REGISTRY_REPO }}
+  IMAGE_NAME: iris-api
+
+jobs:
+  deploy:
+    name: Build and Deploy to GKE
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v1
+      with:
+        credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+    - name: Set up Cloud SDK
+      uses: google-github-actions/setup-gcloud@v1
+
+    - name: Configure Docker for Artifact Registry
+      run: |
+        gcloud auth configure-docker ${{ env.GKE_REGION }}-docker.pkg.dev
+
+    - name: Build Docker image
+      run: |
+        docker build -t ${{ env.GKE_REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.ARTIFACT_REPO }}/${{ env.IMAGE_NAME }}:${{ github.sha }} .
+        docker tag ${{ env.GKE_REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.ARTIFACT_REPO }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
+                   ${{ env.GKE_REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.ARTIFACT_REPO }}/${{ env.IMAGE_NAME }}:latest
+
+    - name: Push to Artifact Registry
+      run: |
+        docker push ${{ env.GKE_REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.ARTIFACT_REPO }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+        docker push ${{ env.GKE_REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.ARTIFACT_REPO }}/${{ env.IMAGE_NAME }}:latest
+
+    - name: Get GKE credentials
+      run: |
+        gcloud container clusters get-credentials ${{ env.GKE_CLUSTER }} --region ${{ env.GKE_REGION }}
+
+    - name: Update Kubernetes manifests
+      run: |
+        # Replace image placeholder in deployment.yaml
+        sed -i "s|IMAGE_PLACEHOLDER|${{ env.GKE_REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.ARTIFACT_REPO }}/${{ env.IMAGE_NAME }}:${{ github.sha }}|g" k8s/deployment.yaml
+        
+        # Show what will be deployed
+        echo "=== Deployment YAML ==="
+        cat k8s/deployment.yaml
+        echo "=== Service YAML ==="
+        cat k8s/service.yaml
+
+    - name: Deploy to GKE
+      run: |
+        kubectl apply -f k8s/deployment.yaml
+        kubectl apply -f k8s/service.yaml
+        kubectl rollout status deployment/iris-api-deployment
+
+    - name: Get deployment info
+      run: |
+        echo "=== Deployments ==="
+        kubectl get deployments
+        
+        echo "=== Pods ==="
+        kubectl get pods -l app=iris-api
+        
+        echo "=== Services ==="
+        kubectl get services
+        
+        echo "=== Waiting for LoadBalancer IP ==="
+        sleep 60
+        
+        EXTERNAL_IP=$(kubectl get service iris-api-service -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+        
+        if [ -z "$EXTERNAL_IP" ]; then
+          echo "⏳ LoadBalancer IP not ready yet"
+          echo "Check later with: kubectl get service iris-api-service"
+        else
+          echo "✅ API deployed successfully!"
+          echo "✅ API URL: http://$EXTERNAL_IP"
+          echo "✅ API Docs: http://$EXTERNAL_IP/docs"
+          echo "✅ Health: http://$EXTERNAL_IP/health"
+        fi

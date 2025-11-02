@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: iris-api-service
+  labels:
+    app: iris-api
+spec:
+  type: LoadBalancer
+  selector:
+    app: iris-api
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80
+      targetPort: 8200
+  sessionAffinity: None
